@@ -1,0 +1,23 @@
+# Python cache and virtual env
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Local secrets
+.env
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Outputs
+output/
+*.log
+
+# Editor and OS files
+.DS_Store
+.vscode/

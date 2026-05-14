@@ -1,0 +1,9 @@
+[project]
+name = "jira-data-extractor"
+version = "0.1.0"
+description = "CLI tool for extracting issue data from Jira"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["jira_extractor"]
