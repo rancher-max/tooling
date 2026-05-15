@@ -27,6 +27,15 @@ def parse_args() -> argparse.Namespace:
         "jql",
         help="Jira Query Language (JQL) string used for extraction.",
     )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=900,
+        help=(
+            "Timeout in seconds for each Ollama request "
+            "(default: 900)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -47,6 +56,8 @@ def run() -> tuple[Path, int]:
     jql = args.jql.strip()
     if not jql:
         raise SystemExit("JQL argument must be a non-empty string.")
+    if args.timeout <= 0:
+        raise SystemExit("--timeout must be greater than 0.")
 
     logger.info("Searching Jira: %s", jql)
     records = client.search_issues(jql=jql)
@@ -65,7 +76,11 @@ def run() -> tuple[Path, int]:
         print("Theme analysis skipped: no issues returned.")
         return csv_path, len(records)
 
-    analyzer = OllamaAnalyzer(model=config.ollama_model, base_url=config.ollama_host)
+    analyzer = OllamaAnalyzer(
+        model=config.ollama_model,
+        base_url=config.ollama_host,
+        timeout_seconds=args.timeout,
+    )
     try:
         analyzer.ensure_available()
         analysis = analyzer.analyze(records, jql=jql)

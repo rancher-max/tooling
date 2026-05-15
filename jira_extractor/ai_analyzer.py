@@ -34,6 +34,8 @@ class IssueStats:
     """Deterministic statistics computed directly from issue records."""
 
     total_issues: int
+    closed_or_resolved_issues: int
+    open_issues: int
     avg_resolution_days: float | None
     median_resolution_days: float | None
     issues_per_customer: dict[str, int]
@@ -316,6 +318,15 @@ class OllamaAnalyzer:
 def _compute_stats(issues: list[IssueRecord]) -> IssueStats:
     """Compute deterministic statistics directly from issue records."""
     resolution_days: list[float] = []
+    closed_statuses = {
+        "resolved",
+        "closed",
+        "done",
+        "completed",
+        "rejected",
+    }
+    closed_or_resolved_count = 0
+
     for issue in issues:
         if issue.created_datetime and issue.resolved_datetime:
             try:
@@ -331,8 +342,18 @@ def _compute_stats(issues: list[IssueRecord]) -> IssueStats:
             except (ValueError, TypeError):
                 pass
 
+        is_closed_or_resolved = (
+            bool((issue.resolved_datetime or "").strip())
+            or bool((issue.resolution or "").strip())
+            or (issue.current_status or "").strip().casefold() in closed_statuses
+        )
+        if is_closed_or_resolved:
+            closed_or_resolved_count += 1
+
     avg = round(statistics.mean(resolution_days), 2) if resolution_days else None
     median = round(statistics.median(resolution_days), 2) if resolution_days else None
+    total_issues = len(issues)
+    open_count = max(total_issues - closed_or_resolved_count, 0)
 
     customer_counts: Counter[str] = Counter()
     for issue in issues:
@@ -340,7 +361,9 @@ def _compute_stats(issues: list[IssueRecord]) -> IssueStats:
         customer_counts[name if name else "(no account)"] += 1
 
     return IssueStats(
-        total_issues=len(issues),
+        total_issues=total_issues,
+        closed_or_resolved_issues=closed_or_resolved_count,
+        open_issues=open_count,
         avg_resolution_days=avg,
         median_resolution_days=median,
         issues_per_customer=dict(customer_counts.most_common()),
@@ -424,6 +447,12 @@ def write_theme_outputs(
     lines.append("```jql")
     lines.append(result.source_jql)
     lines.append("```")
+    lines.append("")
+
+    lines.append("## Status Breakdown")
+    lines.append("")
+    lines.append(f"- Closed/Resolved issues: {stats.closed_or_resolved_issues}")
+    lines.append(f"- Still open issues: {stats.open_issues}")
     lines.append("")
 
     # --- Statistics section ---

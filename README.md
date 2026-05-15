@@ -48,15 +48,21 @@ python3 main.py 'project = "SUSE Rancher Escalations" AND assignee in (mross) AN
 
 ## Output
 The tool writes timestamped files into output/:
-- Issue JSON report
 - Issue CSV report
-- Theme JSON report (if Ollama is reachable)
 - Theme Markdown report (if Ollama is reachable)
 
 If Ollama is unreachable, or if the model returns invalid JSON, extraction still completes and the tool prints a "Theme analysis skipped" message.
 
 ## Runtime Configuration
-The command-line interface accepts one input only: the JQL query string.
+The command-line interface accepts:
+- Required positional argument: JQL query string
+- Optional argument: `--timeout` (seconds per Ollama request, default: `900`)
+
+Example:
+
+```bash
+python3 main.py --timeout 1200 'project = "SUSE Rancher Escalations" AND assignee in (mross)'
+```
 
 Optional runtime behavior can be controlled by environment variables:
 - `JIRA_EXTRACTOR_OUTPUT_DIR` (default: `output`)
