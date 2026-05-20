@@ -39,6 +39,7 @@ class IssueStats:
     avg_resolution_days: float | None
     median_resolution_days: float | None
     issues_per_customer: dict[str, int]
+    issues_per_team: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,7 @@ class OllamaAnalyzer:
                     "status": issue.current_status,
                     "assignee": issue.assignee,
                     "account_name": issue.account_name,
+                    "rancher_team": issue.rancher_team,
                     "resolution": issue.resolution,
                     "resolved_datetime": issue.resolved_datetime,
                     # description = problem statement; comments = resolution details
@@ -154,6 +156,17 @@ class OllamaAnalyzer:
             "confidence": "high|medium|low",
         }
 
+    @staticmethod
+    def _team_theme_schema() -> dict[str, Any]:
+        return {
+            "team": "string — Rancher team name, use '(no team)' when missing",
+            "themes": ["string — concise team-specific themes based on recurring problem_statement patterns"],
+            "potential_action_items": [
+                "string — concrete actions this team can take to reduce recurrence or improve resolution"
+            ],
+            "representative_issue_keys": ["JIRA-123"],
+        }
+
     @classmethod
     def _build_batch_prompt(cls, issues: list[IssueRecord], jql: str) -> str:
         normalized = cls._normalize(issues)
@@ -163,6 +176,7 @@ class OllamaAnalyzer:
             "source_jql": jql,
             "issue_count": len(issues),
             "themes": [cls._theme_schema()],
+            "team_themes": [cls._team_theme_schema()],
             "cross_cutting_observations": [
                 "string — patterns that cut across multiple themes or issues; "
                 "focus on similarities and recurring problem areas"
@@ -173,8 +187,9 @@ class OllamaAnalyzer:
             "Analyze these Jira issues and identify recurring themes. "
             "Each issue has a 'problem_statement' (description field = the reported problem) "
             "and 'resolution_details' (comments = how the issue was resolved). "
-            "Use problem_statement to understand what broke; use resolution_details to understand how it was fixed. "
+            "Use problem_statement to understand what broke; use resolution_details to understand both how it was fixed and the root cause of the problem. "
             "Focus on cross-cutting patterns and similar problem areas rather than restating individual issue facts. "
+            "Also produce team-specific analysis using the 'rancher_team' field: list each team's themes and actionable improvements. "
             "Return strictly valid JSON matching this schema shape and key names exactly:\n"
             f"{json.dumps(schema, indent=2)}\n\n"
             "If information is missing, use empty strings or empty arrays, not null.\n"
@@ -191,6 +206,7 @@ class OllamaAnalyzer:
             "source_jql": jql,
             "issue_count": total_issues,
             "themes": [cls._theme_schema()],
+            "team_themes": [cls._team_theme_schema()],
             "cross_cutting_observations": [
                 "string — patterns that cut across multiple themes or issues; "
                 "focus on similarities and recurring problem areas"
@@ -356,9 +372,13 @@ def _compute_stats(issues: list[IssueRecord]) -> IssueStats:
     open_count = max(total_issues - closed_or_resolved_count, 0)
 
     customer_counts: Counter[str] = Counter()
+    team_counts: Counter[str] = Counter()
     for issue in issues:
         name = (issue.account_name or "").strip()
         customer_counts[name if name else "(no account)"] += 1
+
+        team = (issue.rancher_team or "").strip()
+        team_counts[team if team else "(no team)"] += 1
 
     return IssueStats(
         total_issues=total_issues,
@@ -367,6 +387,7 @@ def _compute_stats(issues: list[IssueRecord]) -> IssueStats:
         avg_resolution_days=avg,
         median_resolution_days=median,
         issues_per_customer=dict(customer_counts.most_common()),
+        issues_per_team=dict(team_counts.most_common()),
     )
 
 
@@ -425,6 +446,7 @@ def _extract_scoped_customers_from_jql(jql: str) -> list[str]:
 def write_theme_outputs(
     result: ThemeAnalysisResult,
     output_dir: Path,
+    page_title: str = "Jira Issue Theme Analysis",
     base_name: str = "jira_issue_themes",
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -434,7 +456,7 @@ def write_theme_outputs(
     stats = result.stats
     # --- Markdown header ---
     lines = [
-        "# Jira Issue Theme Analysis",
+        f"# {page_title}",
         "",
         f"- Generated at (UTC): {timestamp}",
         f"- Model: {result.model}",
@@ -490,9 +512,19 @@ def write_theme_outputs(
             lines.append("- No customer data available.")
         lines.append("")
 
+    lines.append("## Issues by Rancher Team")
+    lines.append("")
+    if stats.issues_per_team:
+        for team, count in stats.issues_per_team.items():
+            lines.append(f"- {team}: {count}")
+    else:
+        lines.append("- No team data available.")
+    lines.append("")
+
     # --- AI analysis ---
     analysis = result.structured
     themes = analysis.get("themes", []) if isinstance(analysis, dict) else []
+    team_themes = analysis.get("team_themes", []) if isinstance(analysis, dict) else []
     observations = (
         analysis.get("cross_cutting_observations", []) if isinstance(analysis, dict) else []
     )
@@ -533,6 +565,38 @@ def write_theme_outputs(
                 lines.append("- Affected components:")
                 for item in components:
                     lines.append(f"  - {item}")
+            lines.append("")
+
+    lines.append("## Themes by Team")
+    lines.append("")
+    if not team_themes:
+        lines.append("No team-specific themes identified.")
+    else:
+        for item in team_themes:
+            if not isinstance(item, dict):
+                continue
+            team_name = item.get("team", "(no team)")
+            lines.append(f"### {team_name}")
+
+            themes_for_team = item.get("themes", [])
+            lines.append("- Themes:")
+            if isinstance(themes_for_team, list) and themes_for_team:
+                for theme in themes_for_team:
+                    lines.append(f"  - {theme}")
+            else:
+                lines.append("  - None")
+
+            action_items = item.get("potential_action_items", [])
+            lines.append("- Potential action items:")
+            if isinstance(action_items, list) and action_items:
+                for action in action_items:
+                    lines.append(f"  - {action}")
+            else:
+                lines.append("  - None")
+
+            representative_keys = item.get("representative_issue_keys", [])
+            if isinstance(representative_keys, list) and representative_keys:
+                lines.append(f"- Representative issue keys: {', '.join(representative_keys)}")
             lines.append("")
 
     md_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")

@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 PAGE_SIZE = 100
 API_VERSION = "2"
 ACCOUNT_NAME_FIELD_ID = "customfield_23901"
+RANCHER_TEAM_FIELD_ID = "customfield_23900"
 
 
 @dataclass
@@ -28,6 +29,7 @@ class IssueRecord:
     issue_title: str
     assignee: str
     account_name: str
+    rancher_team: str
     reporter: str
     created_datetime: str
     updated_datetime: str
@@ -99,6 +101,7 @@ class JiraClient:
     def _request_fields(self) -> list[str]:
         fields = list(_BASE_FIELDS)
         fields.append(ACCOUNT_NAME_FIELD_ID)
+        fields.append(RANCHER_TEAM_FIELD_ID)
         return fields
 
     def _iter_search_pages(self, jql: str) -> Iterator[dict[str, Any]]:
@@ -159,8 +162,9 @@ class JiraClient:
 
     # ---- Mapping -------------------------------------------------------
 
-    def _extract_account_name(self, fields: dict[str, Any]) -> str:
-        value = fields.get(ACCOUNT_NAME_FIELD_ID)
+    @staticmethod
+    def _extract_custom_field_value(fields: dict[str, Any], field_id: str) -> str:
+        value = fields.get(field_id)
         if value is None:
             return ""
         if isinstance(value, str):
@@ -185,6 +189,12 @@ class JiraClient:
                             break
             return ", ".join(names)
         return str(value)
+
+    def _extract_account_name(self, fields: dict[str, Any]) -> str:
+        return self._extract_custom_field_value(fields, ACCOUNT_NAME_FIELD_ID)
+
+    def _extract_rancher_team(self, fields: dict[str, Any]) -> str:
+        return self._extract_custom_field_value(fields, RANCHER_TEAM_FIELD_ID)
 
     @staticmethod
     def _named(value: Any, key: str = "displayName", default: str = "") -> str:
@@ -225,6 +235,7 @@ class JiraClient:
             issue_title=str(fields.get("summary", "") or ""),
             assignee=self._named(fields.get("assignee"), default="Unassigned"),
             account_name=self._extract_account_name(fields),
+            rancher_team=self._extract_rancher_team(fields),
             reporter=self._named(fields.get("reporter"), default=""),
             created_datetime=str(fields.get("created", "") or ""),
             updated_datetime=str(fields.get("updated", "") or ""),

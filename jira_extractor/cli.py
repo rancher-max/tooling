@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -36,6 +37,19 @@ def parse_args() -> argparse.Namespace:
             "(default: 900)."
         ),
     )
+    parser.add_argument(
+        "--page-title",
+        default="Jira Issue Theme Analysis",
+        help="Title used as the top heading in the generated Markdown report.",
+    )
+    parser.add_argument(
+        "--base-filename",
+        default="jira_issues",
+        help=(
+            "Base filename for generated CSV/Markdown outputs "
+            "(timestamp and extension are appended)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -58,11 +72,21 @@ def run() -> tuple[Path, int]:
         raise SystemExit("JQL argument must be a non-empty string.")
     if args.timeout <= 0:
         raise SystemExit("--timeout must be greater than 0.")
+    if not args.page_title.strip():
+        raise SystemExit("--page-title must be a non-empty string.")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", args.base_filename):
+        raise SystemExit(
+            "--base-filename may only contain letters, numbers, dot, underscore, and dash."
+        )
 
     logger.info("Searching Jira: %s", jql)
     records = client.search_issues(jql=jql)
 
-    csv_path = write_outputs(records, config.output_dir)
+    csv_path = write_outputs(
+        records,
+        config.output_dir,
+        base_name=args.base_filename,
+    )
 
     print(f"JQL: {jql}")
     print(f"Issues extracted: {len(records)}")
@@ -84,7 +108,12 @@ def run() -> tuple[Path, int]:
     try:
         analyzer.ensure_available()
         analysis = analyzer.analyze(records, jql=jql)
-        analysis_md = write_theme_outputs(analysis, config.output_dir)
+        analysis_md = write_theme_outputs(
+            analysis,
+            config.output_dir,
+            page_title=args.page_title,
+            base_name=args.base_filename,
+        )
         print(f"Theme analysis Markdown: {analysis_md}")
     except OllamaUnavailableError as error:
         print(f"Theme analysis skipped: {error}")
