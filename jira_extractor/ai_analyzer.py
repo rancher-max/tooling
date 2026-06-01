@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import statistics
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,6 +39,15 @@ class IssueStats:
     open_issues: int
     avg_resolution_days: float | None
     median_resolution_days: float | None
+    # Time from issue creation to first comment by the assignee.
+    avg_initial_response_days: float | None
+    median_initial_response_days: float | None
+    # Time the issue was open and NOT in "Waiting for Reporter" status.
+    avg_time_actively_worked_days: float | None
+    median_time_actively_worked_days: float | None
+    # Time the issue spent in "Waiting for Reporter" status.
+    avg_time_waiting_days: float | None
+    median_time_waiting_days: float | None
     issues_per_customer: dict[str, int]
     issues_per_team: dict[str, int]
 
@@ -58,40 +68,73 @@ class OllamaAnalyzer:
         model: str,
         base_url: str = "http://localhost:11434",
         timeout_seconds: int = 900,
+        max_retries: int = 2,
+        retry_backoff_seconds: float = 5.0,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.max_retries = max(max_retries, 0)
+        self.retry_backoff_seconds = max(retry_backoff_seconds, 0.0)
         self.session = requests.Session()
 
     # ---- HTTP ----------------------------------------------------------
 
+    @staticmethod
+    def _is_retryable_request_error(exc: requests.RequestException) -> bool:
+        if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+            return True
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            return exc.response.status_code in {408, 429, 500, 502, 503, 504}
+        return False
+
     def _chat(self, prompt: str) -> str:
-        response = self.session.post(
-            f"{self.base_url}/api/chat",
-            json={
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a precise issue triage analyst. "
-                            "Return only valid JSON. No markdown fences, no prose "
-                            "outside the JSON object."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                "stream": False,
-                # Force JSON-only output from Ollama (supported since 0.1.30+).
-                "format": "json",
-                "options": {"temperature": 0.1},
-            },
-            timeout=self.timeout_seconds,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        return str(payload.get("message", {}).get("content", "")).strip()
+        request_payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise issue triage analyst. "
+                        "Return only valid JSON. No markdown fences, no prose "
+                        "outside the JSON object."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            # Force JSON-only output from Ollama (supported since 0.1.30+).
+            "format": "json",
+            "options": {"temperature": 0.1},
+        }
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.session.post(
+                    f"{self.base_url}/api/chat",
+                    json=request_payload,
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                return str(payload.get("message", {}).get("content", "")).strip()
+            except requests.RequestException as exc:
+                is_last_attempt = attempt >= self.max_retries
+                if is_last_attempt or not self._is_retryable_request_error(exc):
+                    raise
+
+                backoff = self.retry_backoff_seconds * (2**attempt)
+                logger.warning(
+                    "Ollama request failed (%s). Retrying in %.1fs (%d/%d)...",
+                    exc,
+                    backoff,
+                    attempt + 1,
+                    self.max_retries,
+                )
+                if backoff > 0:
+                    time.sleep(backoff)
+
+        raise RuntimeError("unreachable")
 
     def ensure_available(self) -> None:
         try:
@@ -335,9 +378,68 @@ class OllamaAnalyzer:
         )
 
 
+_WAITING_STATUS = "waiting for reporter"
+
+
+def _parse_iso(ts: str) -> datetime | None:
+    """Parse an ISO 8601 timestamp, returning None on failure."""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _compute_status_durations(
+    created_dt: datetime,
+    end_dt: datetime,
+    transitions: list[dict[str, Any]],
+) -> tuple[float, float]:
+    """Return (time_waiting_days, time_actively_worked_days) for one issue.
+
+    *time_waiting_days* is time spent in "Waiting for Reporter" status.
+    *time_actively_worked_days* is total open time minus waiting time.
+    """
+    if not transitions:
+        # No status transitions recorded; treat entire open period as active work.
+        total = max((end_dt - created_dt).total_seconds() / 86400.0, 0.0)
+        return 0.0, total
+
+    # Reconstruct the status at creation from the first transition's from_status.
+    initial_status = transitions[0].get("from_status", "")
+
+    # Build a timeline of (datetime, status).
+    timeline: list[tuple[datetime, str]] = [(created_dt, initial_status)]
+    for t in transitions:
+        ts = _parse_iso(t.get("timestamp", ""))
+        if ts is None:
+            continue
+        timeline.append((ts, t.get("to_status", "")))
+    timeline.append((end_dt, ""))  # sentinel
+
+    # Ensure timeline is sorted in case changelog timestamps are out of order.
+    timeline.sort(key=lambda x: x[0])
+
+    waiting = 0.0
+    active = 0.0
+    for i in range(len(timeline) - 1):
+        seg_start, status = timeline[i]
+        seg_end, _ = timeline[i + 1]
+        duration = max((seg_end - seg_start).total_seconds() / 86400.0, 0.0)
+        if status.strip().casefold() == _WAITING_STATUS:
+            waiting += duration
+        else:
+            active += duration
+
+    return waiting, active
+
+
 def _compute_stats(issues: list[IssueRecord]) -> IssueStats:
     """Compute deterministic statistics directly from issue records."""
     resolution_days: list[float] = []
+    initial_response_days: list[float] = []
+    time_actively_worked_days: list[float] = []
+    time_waiting_days: list[float] = []
+
     closed_statuses = {
         "resolved",
         "closed",
@@ -346,21 +448,19 @@ def _compute_stats(issues: list[IssueRecord]) -> IssueStats:
         "rejected",
     }
     closed_or_resolved_count = 0
+    now = datetime.now(timezone.utc)
 
     for issue in issues:
-        if issue.created_datetime and issue.resolved_datetime:
-            try:
-                created = datetime.fromisoformat(
-                    issue.created_datetime.replace("Z", "+00:00")
-                )
-                resolved = datetime.fromisoformat(
-                    issue.resolved_datetime.replace("Z", "+00:00")
-                )
-                delta = (resolved - created).total_seconds() / 86400.0
-                if delta >= 0:
-                    resolution_days.append(delta)
-            except (ValueError, TypeError):
-                pass
+        created_dt = _parse_iso(issue.created_datetime) if issue.created_datetime else None
+
+        resolved_dt: datetime | None = None
+        if issue.resolved_datetime:
+            resolved_dt = _parse_iso(issue.resolved_datetime)
+
+        if created_dt and resolved_dt:
+            delta = (resolved_dt - created_dt).total_seconds() / 86400.0
+            if delta >= 0:
+                resolution_days.append(delta)
 
         is_closed_or_resolved = (
             bool((issue.resolved_datetime or "").strip())
@@ -370,8 +470,44 @@ def _compute_stats(issues: list[IssueRecord]) -> IssueStats:
         if is_closed_or_resolved:
             closed_or_resolved_count += 1
 
-    avg = round(statistics.mean(resolution_days), 2) if resolution_days else None
-    median = round(statistics.median(resolution_days), 2) if resolution_days else None
+        # --- Time to initial response (first assignee comment) ---
+        if created_dt and issue.assignee and issue.assignee != "Unassigned":
+            try:
+                comment_entries: list[dict[str, Any]] = json.loads(
+                    issue.comment_authors_dates or "[]"
+                )
+                assignee_cf = issue.assignee.strip().casefold()
+                for entry in comment_entries:
+                    author = (entry.get("author") or "").strip().casefold()
+                    if author == assignee_cf:
+                        response_dt = _parse_iso(entry.get("created", ""))
+                        if response_dt:
+                            delta = (response_dt - created_dt).total_seconds() / 86400.0
+                            if delta >= 0:
+                                initial_response_days.append(delta)
+                        break
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+
+        # --- Time actively worked / time waiting ---
+        if created_dt:
+            end_dt = resolved_dt if resolved_dt else now
+            try:
+                transitions: list[dict[str, Any]] = json.loads(
+                    issue.status_history or "[]"
+                )
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                transitions = []
+            waiting, active = _compute_status_durations(created_dt, end_dt, transitions)
+            time_waiting_days.append(waiting)
+            time_actively_worked_days.append(active)
+
+    def _avg(vals: list[float]) -> float | None:
+        return round(statistics.mean(vals), 2) if vals else None
+
+    def _median(vals: list[float]) -> float | None:
+        return round(statistics.median(vals), 2) if vals else None
+
     total_issues = len(issues)
     open_count = max(total_issues - closed_or_resolved_count, 0)
 
@@ -388,8 +524,14 @@ def _compute_stats(issues: list[IssueRecord]) -> IssueStats:
         total_issues=total_issues,
         closed_or_resolved_issues=closed_or_resolved_count,
         open_issues=open_count,
-        avg_resolution_days=avg,
-        median_resolution_days=median,
+        avg_resolution_days=_avg(resolution_days),
+        median_resolution_days=_median(resolution_days),
+        avg_initial_response_days=_avg(initial_response_days),
+        median_initial_response_days=_median(initial_response_days),
+        avg_time_actively_worked_days=_avg(time_actively_worked_days),
+        median_time_actively_worked_days=_median(time_actively_worked_days),
+        avg_time_waiting_days=_avg(time_waiting_days),
+        median_time_waiting_days=_median(time_waiting_days),
         issues_per_customer=dict(customer_counts.most_common()),
         issues_per_team=dict(team_counts.most_common()),
     )
@@ -494,6 +636,64 @@ def write_theme_outputs(
         else:
             lines.append("- Median time to resolution: N/A")
         lines.append("")
+
+    # --- Time metrics (always shown) ---
+    lines.append("## Time Metrics")
+    lines.append("")
+    lines.append("### Time to Initial Response")
+    lines.append(
+        "> Time from issue creation to the first comment posted by the assignee."
+    )
+    lines.append("")
+    if stats.avg_initial_response_days is not None:
+        lines.append(
+            f"- Average time to initial response: **{stats.avg_initial_response_days} days**"
+        )
+    else:
+        lines.append("- Average time to initial response: N/A")
+    if stats.median_initial_response_days is not None:
+        lines.append(
+            f"- Median time to initial response: **{stats.median_initial_response_days} days**"
+        )
+    else:
+        lines.append("- Median time to initial response: N/A")
+    lines.append("")
+    lines.append("### Time Actively Worked")
+    lines.append(
+        "> Time the issue was open and **not** in *Waiting for Reporter* status."
+    )
+    lines.append("")
+    if stats.avg_time_actively_worked_days is not None:
+        lines.append(
+            f"- Average time actively worked: **{stats.avg_time_actively_worked_days} days**"
+        )
+    else:
+        lines.append("- Average time actively worked: N/A")
+    if stats.median_time_actively_worked_days is not None:
+        lines.append(
+            f"- Median time actively worked: **{stats.median_time_actively_worked_days} days**"
+        )
+    else:
+        lines.append("- Median time actively worked: N/A")
+    lines.append("")
+    lines.append("### Time Waiting for Reporter")
+    lines.append(
+        "> Time the issue spent in *Waiting for Reporter* status."
+    )
+    lines.append("")
+    if stats.avg_time_waiting_days is not None:
+        lines.append(
+            f"- Average time waiting for reporter: **{stats.avg_time_waiting_days} days**"
+        )
+    else:
+        lines.append("- Average time waiting for reporter: N/A")
+    if stats.median_time_waiting_days is not None:
+        lines.append(
+            f"- Median time waiting for reporter: **{stats.median_time_waiting_days} days**"
+        )
+    else:
+        lines.append("- Median time waiting for reporter: N/A")
+    lines.append("")
 
     # --- Issues by customer ---
     scoped_customers = _extract_scoped_customers_from_jql(result.source_jql)

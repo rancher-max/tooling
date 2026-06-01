@@ -38,6 +38,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ollama-retries",
+        type=int,
+        default=2,
+        help=(
+            "Number of retry attempts for transient Ollama request failures "
+            "such as read timeouts (default: 2)."
+        ),
+    )
+    parser.add_argument(
         "--page-title",
         default="Jira Issue Theme Analysis",
         help="Title used as the top heading in the generated Markdown report.",
@@ -72,6 +81,8 @@ def run() -> tuple[Path, int]:
         raise SystemExit("JQL argument must be a non-empty string.")
     if args.timeout <= 0:
         raise SystemExit("--timeout must be greater than 0.")
+    if args.ollama_retries < 0:
+        raise SystemExit("--ollama-retries must be 0 or greater.")
     if not args.page_title.strip():
         raise SystemExit("--page-title must be a non-empty string.")
     if not re.fullmatch(r"[A-Za-z0-9._-]+", args.base_filename):
@@ -104,8 +115,13 @@ def run() -> tuple[Path, int]:
         model=config.ollama_model,
         base_url=config.ollama_host,
         timeout_seconds=args.timeout,
+        max_retries=args.ollama_retries,
     )
     try:
+        print(
+            "Running AI theme analysis "
+            f"(model={config.ollama_model}, timeout={args.timeout}s, retries={args.ollama_retries})..."
+        )
         analyzer.ensure_available()
         analysis = analyzer.analyze(records, jql=jql)
         analysis_md = write_theme_outputs(

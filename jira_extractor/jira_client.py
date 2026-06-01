@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import logging
 from dataclasses import dataclass, asdict, fields as dataclass_fields
 from datetime import datetime, timezone
@@ -40,6 +41,11 @@ class IssueRecord:
     resolved_datetime: str
     description: str
     comments: str
+    # JSON-encoded list of {"timestamp": str, "from_status": str, "to_status": str}
+    # sorted ascending by timestamp; used for "time waiting" / "time actively worked" metrics.
+    status_history: str = ""
+    # JSON-encoded list of {"author": str, "created": str}; used for "time to initial response".
+    comment_authors_dates: str = ""
 
 
 # Default Jira issue fields to request. The account-name custom field id (if
@@ -61,9 +67,15 @@ _BASE_FIELDS: tuple[str, ...] = (
 
 
 class JiraClient:
-    def __init__(self, config: JiraConfig, timeout_seconds: int = 30) -> None:
+    def __init__(
+        self,
+        config: JiraConfig,
+        timeout_seconds: int = 30,
+        fetch_changelog: bool = True,
+    ) -> None:
         self.config = config
         self.timeout_seconds = timeout_seconds
+        self.fetch_changelog = fetch_changelog
         self.session = requests.Session()
 
         retries = Retry(
@@ -160,6 +172,84 @@ class JiraClient:
 
         return all_comments
 
+    def fetch_status_history(self, issue_key: str) -> list[dict[str, Any]]:
+        """Return status transitions for an issue, sorted by timestamp ascending.
+
+        Each entry: {"timestamp": str, "from_status": str, "to_status": str}
+
+        Tries the paginated /changelog endpoint (Jira 8.x+) first; on 404 falls
+        back to fetching the issue with expand=changelog (older Jira Server/DC).
+        """
+        try:
+            return self._fetch_status_history_paginated(issue_key)
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                logger.debug(
+                    "Paginated changelog unavailable for %s (404); "
+                    "retrying with expand=changelog.",
+                    issue_key,
+                )
+                return self._fetch_status_history_expand(issue_key)
+            raise
+
+    def _fetch_status_history_paginated(
+        self, issue_key: str
+    ) -> list[dict[str, Any]]:
+        transitions: list[dict[str, Any]] = []
+        start_at = 0
+
+        while True:
+            data = self._request(
+                "GET",
+                f"issue/{issue_key}/changelog",
+                params={"startAt": start_at, "maxResults": PAGE_SIZE},
+            )
+            histories = data.get("values", []) or []
+            for history in histories:
+                created = str(history.get("created", ""))
+                for item in history.get("items", []):
+                    if item.get("field") == "status":
+                        transitions.append(
+                            {
+                                "timestamp": created,
+                                "from_status": str(item.get("fromString", "")),
+                                "to_status": str(item.get("toString", "")),
+                            }
+                        )
+            fetched = len(histories)
+            try:
+                total = int(data.get("total", 0))
+            except (TypeError, ValueError):
+                total = 0
+            start_at += fetched
+            if fetched == 0 or start_at >= total:
+                break
+
+        return sorted(transitions, key=lambda x: x["timestamp"])
+
+    def _fetch_status_history_expand(
+        self, issue_key: str
+    ) -> list[dict[str, Any]]:
+        data = self._request(
+            "GET",
+            f"issue/{issue_key}",
+            params={"expand": "changelog", "fields": ""},
+        )
+        histories = (data.get("changelog") or {}).get("histories", []) or []
+        transitions: list[dict[str, Any]] = []
+        for history in histories:
+            created = str(history.get("created", ""))
+            for item in history.get("items", []):
+                if item.get("field") == "status":
+                    transitions.append(
+                        {
+                            "timestamp": created,
+                            "from_status": str(item.get("fromString", "")),
+                            "to_status": str(item.get("toString", "")),
+                        }
+                    )
+        return sorted(transitions, key=lambda x: x["timestamp"])
+
     # ---- Mapping -------------------------------------------------------
 
     @staticmethod
@@ -230,8 +320,29 @@ class JiraClient:
             created = str(comment.get("created", ""))
             comments_text.append(f"[{created}] {author}: {body}")
 
+        comment_authors_dates = json.dumps(
+            [
+                {
+                    "author": self._named(comment.get("author"), default="Unknown"),
+                    "created": str(comment.get("created", "")),
+                }
+                for comment in comments_raw
+            ]
+        )
+
+        issue_key = str(issue.get("key", ""))
+        if self.fetch_changelog:
+            try:
+                status_transitions = self.fetch_status_history(issue_key)
+                status_history_json = json.dumps(status_transitions)
+            except requests.RequestException as exc:
+                logger.warning("Failed to fetch changelog for %s: %s", issue_key, exc)
+                status_history_json = "[]"
+        else:
+            status_history_json = "[]"
+
         return IssueRecord(
-            key=str(issue.get("key", "")),
+            key=issue_key,
             issue_title=str(fields.get("summary", "") or ""),
             assignee=self._named(fields.get("assignee"), default="Unassigned"),
             account_name=self._extract_account_name(fields),
@@ -246,6 +357,8 @@ class JiraClient:
             resolved_datetime=str(fields.get("resolutiondate", "") or ""),
             description=adf_to_text(fields.get("description", "")).strip(),
             comments="\n\n".join(comments_text).strip(),
+            status_history=status_history_json,
+            comment_authors_dates=comment_authors_dates,
         )
 
 

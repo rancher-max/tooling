@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import statistics
 from datetime import datetime
 
 import requests
 
+from jira_extractor.ai_analyzer import _compute_stats
 from jira_extractor.config import load_config
 from jira_extractor.jira_client import IssueRecord, JiraClient
 
@@ -165,13 +167,36 @@ def main() -> None:
 
     jqls = build_jqls(projects, assignees, args.weeks)
 
-    client = JiraClient(config)
+    client = JiraClient(config, fetch_changelog=True)
+
+    print("Starting Jira metrics collection...", flush=True)
+    print("This can take a while for large issue sets.", flush=True)
 
     try:
+        print("[1/4] Fetching active issues...", flush=True)
         active_issues = client.search_issues(jqls["active"])
+        print(f"[1/4] Done. Retrieved {len(active_issues)} active issues.", flush=True)
+
+        print("[2/4] Fetching active issues waiting for reporter...", flush=True)
         waiting_issues = client.search_issues(jqls["active_waiting_for_reporter"])
+        print(
+            f"[2/4] Done. Retrieved {len(waiting_issues)} waiting-for-reporter issues.",
+            flush=True,
+        )
+
+        print(f"[3/4] Fetching issues created in the last {args.weeks} weeks...", flush=True)
         new_issues_window = client.search_issues(jqls["new_created_window"])
+        print(
+            f"[3/4] Done. Retrieved {len(new_issues_window)} newly created issues.",
+            flush=True,
+        )
+
+        print(f"[4/4] Fetching resolved issues from the last {args.weeks} weeks...", flush=True)
         resolved_issues_window = client.search_issues(jqls["resolved_window"])
+        print(
+            f"[4/4] Done. Retrieved {len(resolved_issues_window)} resolved issues.",
+            flush=True,
+        )
     except requests.HTTPError as error:
         print("Jira query failed with HTTP error.")
         print(f"Details: {_extract_http_error_message(error)}")
@@ -179,6 +204,8 @@ def main() -> None:
         for name, query in jqls.items():
             print(f"{name}: {query}")
         raise SystemExit(1) from error
+
+    print("Computing metrics...", flush=True)
 
     avg_new_per_week = len(new_issues_window) / args.weeks
     avg_resolved_per_week = len(resolved_issues_window) / args.weeks
@@ -195,6 +222,29 @@ def main() -> None:
     print(f"Assignees ({len(assignees)}): {', '.join(assignees)}")
     print(f"Rolling window (weeks): {args.weeks}")
 
+    resolved_stats = _compute_stats(resolved_issues_window)
+    active_stats = _compute_stats(active_issues)
+
+    # Add context so a median of 0 is easy to interpret.
+    resolved_waiting_days: list[float] = []
+    for issue in resolved_issues_window:
+        issue_stats = _compute_stats([issue])
+        if issue_stats.avg_time_waiting_days is not None:
+            resolved_waiting_days.append(issue_stats.avg_time_waiting_days)
+    resolved_waiting_non_zero = [days for days in resolved_waiting_days if days > 0]
+    resolved_waiting_non_zero_median = (
+        round(statistics.median(resolved_waiting_non_zero), 2)
+        if resolved_waiting_non_zero
+        else None
+    )
+    resolved_waiting_any_count = len(resolved_waiting_non_zero)
+    resolved_waiting_total = len(resolved_waiting_days)
+    resolved_waiting_any_pct = (
+        (resolved_waiting_any_count / resolved_waiting_total) * 100.0
+        if resolved_waiting_total
+        else 0.0
+    )
+
     _print_section("Metrics")
     print(f"Average number of new issues per week: {avg_new_per_week:.2f}")
     print(f"Current number of active issues: {len(active_issues)}")
@@ -203,6 +253,46 @@ def main() -> None:
         f"{len(waiting_issues)}"
     )
     print(f"Average number of resolved issues per week: {avg_resolved_per_week:.2f}")
+
+    def _fmt(val: float | None) -> str:
+        return f"{val} days" if val is not None else "N/A"
+
+    _print_section(f"Time metrics — resolved issues (last {args.weeks} weeks)")
+    print(
+        f"  Avg time to initial response:  {_fmt(resolved_stats.avg_initial_response_days)}"
+        f"  |  Median: {_fmt(resolved_stats.median_initial_response_days)}"
+    )
+    print(
+        f"  Avg time actively worked:      {_fmt(resolved_stats.avg_time_actively_worked_days)}"
+        f"  |  Median: {_fmt(resolved_stats.median_time_actively_worked_days)}"
+    )
+    print(
+        f"  Avg time waiting for reporter: {_fmt(resolved_stats.avg_time_waiting_days)}"
+        f"  |  Median: {_fmt(resolved_stats.median_time_waiting_days)}"
+    )
+    print(
+        "  Resolved issues with any waiting time: "
+        f"{resolved_waiting_any_count}/{resolved_waiting_total} "
+        f"({resolved_waiting_any_pct:.1f}%)"
+    )
+    print(
+        "  Median waiting time (only issues that waited): "
+        f"{_fmt(resolved_waiting_non_zero_median)}"
+    )
+    print(
+        f"  Avg time to resolution:        {_fmt(resolved_stats.avg_resolution_days)}"
+        f"  |  Median: {_fmt(resolved_stats.median_resolution_days)}"
+    )
+
+    _print_section("Time metrics — currently active issues")
+    print(
+        f"  Avg time actively worked so far:      {_fmt(active_stats.avg_time_actively_worked_days)}"
+        f"  |  Median: {_fmt(active_stats.median_time_actively_worked_days)}"
+    )
+    print(
+        f"  Avg time waiting for reporter so far: {_fmt(active_stats.avg_time_waiting_days)}"
+        f"  |  Median: {_fmt(active_stats.median_time_waiting_days)}"
+    )
 
     _print_section("Data quality")
     print(
