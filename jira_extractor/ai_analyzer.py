@@ -5,6 +5,7 @@ import logging
 import re
 import statistics
 import time
+from difflib import SequenceMatcher
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -189,6 +190,21 @@ class OllamaAnalyzer:
         return normalized
 
     @staticmethod
+    def _is_closed_or_resolved(issue: IssueRecord) -> bool:
+        closed_statuses = {
+            "resolved",
+            "closed",
+            "done",
+            "completed",
+            "rejected",
+        }
+        return (
+            bool((issue.resolved_datetime or "").strip())
+            or bool((issue.resolution or "").strip())
+            or (issue.current_status or "").strip().casefold() in closed_statuses
+        )
+
+    @staticmethod
     def _theme_schema() -> dict[str, Any]:
         return {
             "theme": "string — concise label for this cluster of issues",
@@ -203,7 +219,10 @@ class OllamaAnalyzer:
     def _team_theme_schema() -> dict[str, Any]:
         return {
             "team": "string — Rancher team name, use '(no team)' when missing",
-            "themes": ["string — concise team-specific themes based on recurring problem_statement patterns"],
+            "themes": [
+                "string — clustered team themes based on repeated similarities across multiple issues; "
+                "do not produce one theme per issue"
+            ],
             "potential_action_items": [
                 "string — concrete actions this team can take to reduce recurrence or improve resolution"
             ],
@@ -213,7 +232,14 @@ class OllamaAnalyzer:
     @classmethod
     def _build_batch_prompt(cls, issues: list[IssueRecord], jql: str) -> str:
         normalized = cls._normalize(issues)
-        serialized = json.dumps(normalized, indent=2)
+        resolved_only = [
+            item for issue, item in zip(issues, normalized) if cls._is_closed_or_resolved(issue)
+        ]
+        payload = {
+            "all_issues": normalized,
+            "resolved_issues_for_team_themes": resolved_only,
+        }
+        serialized = json.dumps(payload, indent=2)
 
         schema = {
             "source_jql": jql,
@@ -234,12 +260,16 @@ class OllamaAnalyzer:
             "The comments contain the actual diagnostic insights and solutions; use them as the primary source for themes and especially for actionable improvements. "
             "Problem patterns can draw from both, but action items MUST be derived primarily from resolution_details. "
             "Focus on recurring patterns, root causes, and solutions rather than just problem restatement. "
-            "Also produce team-specific analysis using the 'rancher_team' field: for each team, extract themes and concrete, actionable improvements based on the resolution patterns observed in their issues. "
+            "Also produce team-specific analysis using the 'rancher_team' field, but ONLY from the 'resolved_issues_for_team_themes' array. "
+            "Do not use in-progress or unresolved issues for team_themes or potential_action_items. "
+            "For team_themes, cluster issues by similarity and recurrence (e.g., multiple upgrade-related issues -> one upgrade theme). "
+            "Do not list one theme per issue, and merge semantically similar themes into one concise label. "
+            "If 'resolved_issues_for_team_themes' is empty, return team_themes as an empty array. "
             "Return strictly valid JSON matching this schema shape and key names exactly:\n"
             f"{json.dumps(schema, indent=2)}\n\n"
             "If information is missing, use empty strings or empty arrays, not null.\n"
             f"Source JQL:\n{jql}\n\n"
-            "Issue data:\n"
+            "Issue data payload:\n"
             f"{serialized}"
         )
 
@@ -267,11 +297,149 @@ class OllamaAnalyzer:
             "Prioritize observations that recur across multiple batches — these are the most significant signals. "
             "When synthesizing team-specific themes and action items, emphasize patterns from resolution_details (comments) "
             "to ensure action items are concrete and grounded in real troubleshooting experience. "
+            "Keep team_themes restricted to resolved issues only. "
+            "Merge duplicate or highly similar team themes into a single clustered theme per team and avoid per-issue summaries. "
             "Return strictly valid JSON matching this schema shape and key names exactly:\n"
             f"{json.dumps(schema, indent=2)}\n\n"
             "If information is missing, use empty strings or empty arrays, not null.\n"
             f"Batch analyses:\n{serialized}"
         )
+
+    @staticmethod
+    def _normalize_text_for_similarity(value: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9\s]", " ", (value or "").casefold())
+        return " ".join(cleaned.split())
+
+    @classmethod
+    def _append_unique_similar_text(
+        cls, target: list[str], values: list[str], similarity_threshold: float = 0.82
+    ) -> None:
+        for raw in values:
+            if not isinstance(raw, str):
+                continue
+            candidate = raw.strip()
+            if not candidate:
+                continue
+            candidate_norm = cls._normalize_text_for_similarity(candidate)
+            if not candidate_norm:
+                continue
+
+            exists = False
+            for existing in target:
+                existing_norm = cls._normalize_text_for_similarity(existing)
+                if not existing_norm:
+                    continue
+                if candidate_norm == existing_norm:
+                    exists = True
+                    break
+                ratio = SequenceMatcher(None, candidate_norm, existing_norm).ratio()
+                if ratio >= similarity_threshold:
+                    exists = True
+                    break
+
+            if not exists:
+                target.append(candidate)
+
+    @classmethod
+    def _dedupe_team_theme_entries(cls, team_entry: dict[str, Any]) -> dict[str, Any]:
+        deduped_themes: list[str] = []
+        themes = team_entry.get("themes", [])
+        if isinstance(themes, list):
+            cls._append_unique_similar_text(deduped_themes, themes)
+        team_entry["themes"] = deduped_themes
+
+        deduped_actions: list[str] = []
+        actions = team_entry.get("potential_action_items", [])
+        if isinstance(actions, list):
+            cls._append_unique_similar_text(deduped_actions, actions)
+        team_entry["potential_action_items"] = deduped_actions
+
+        representative = team_entry.get("representative_issue_keys", [])
+        if isinstance(representative, list):
+            seen_keys: set[str] = set()
+            unique_keys: list[str] = []
+            for key in representative:
+                key_str = str(key).strip()
+                if key_str and key_str not in seen_keys:
+                    seen_keys.add(key_str)
+                    unique_keys.append(key_str)
+            team_entry["representative_issue_keys"] = unique_keys
+        else:
+            team_entry["representative_issue_keys"] = []
+
+        return team_entry
+
+    @classmethod
+    def _enforce_resolved_only_team_themes(
+        cls, structured: dict[str, Any], issues: list[IssueRecord]
+    ) -> None:
+        resolved_issues = [issue for issue in issues if cls._is_closed_or_resolved(issue)]
+        resolved_keys = {issue.key for issue in resolved_issues if issue.key}
+        teams_with_resolved = {
+            ((issue.rancher_team or "").strip() or "(no team)") for issue in resolved_issues
+        }
+
+        if not resolved_issues:
+            structured["team_themes"] = []
+            return
+
+        raw_team_themes = structured.get("team_themes", [])
+        if not isinstance(raw_team_themes, list):
+            structured["team_themes"] = []
+            return
+
+        filtered: list[dict[str, Any]] = []
+        merged_by_team: dict[str, dict[str, Any]] = {}
+        for item in raw_team_themes:
+            if not isinstance(item, dict):
+                continue
+
+            team_name = (str(item.get("team", "")).strip() or "(no team)")
+            if team_name not in teams_with_resolved:
+                continue
+
+            representative = item.get("representative_issue_keys", [])
+            normalized_representative: list[str] = []
+            if isinstance(representative, list):
+                normalized_representative = [
+                    str(key) for key in representative if str(key) in resolved_keys
+                ]
+            item["representative_issue_keys"] = normalized_representative
+
+            if team_name not in merged_by_team:
+                merged_by_team[team_name] = {
+                    "team": team_name,
+                    "themes": [],
+                    "potential_action_items": [],
+                    "representative_issue_keys": [],
+                }
+
+            merged_entry = merged_by_team[team_name]
+            cls._append_unique_similar_text(
+                merged_entry["themes"],
+                item.get("themes", []) if isinstance(item.get("themes", []), list) else [],
+            )
+            cls._append_unique_similar_text(
+                merged_entry["potential_action_items"],
+                (
+                    item.get("potential_action_items", [])
+                    if isinstance(item.get("potential_action_items", []), list)
+                    else []
+                ),
+            )
+
+            rep_keys = item.get("representative_issue_keys", [])
+            if isinstance(rep_keys, list):
+                cls._append_unique_similar_text(
+                    merged_entry["representative_issue_keys"],
+                    [str(k) for k in rep_keys],
+                    similarity_threshold=1.0,
+                )
+
+        for merged in merged_by_team.values():
+            filtered.append(cls._dedupe_team_theme_entries(merged))
+
+        structured["team_themes"] = filtered
 
     def _split_into_batches(self, issues: list[IssueRecord]) -> list[list[IssueRecord]]:
         """Split issues into batches whose serialized payload each fits within the limit."""
@@ -367,6 +535,8 @@ class OllamaAnalyzer:
             synthesis_prompt = self._build_synthesis_prompt(batch_analyses, jql, len(issues))
             raw = self._chat(synthesis_prompt)
             structured = self._extract_json(raw)
+
+        self._enforce_resolved_only_team_themes(structured, issues)
 
         return ThemeAnalysisResult(
             model=self.model,
