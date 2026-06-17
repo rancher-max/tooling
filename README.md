@@ -131,6 +131,61 @@ python3 jira_metrics_report.py --weeks 8 --projects SURE,NVSHAS,OBS
 
 ---
 
+## `jira_phrase_extractor.py` — Phrase/Window Issue Extractor
+
+Standalone phrase-based extractor with no AI theme analysis. It builds JQL from
+`--phrase` and `--window`, fetches matching issues, and writes CSV output.
+
+### Run
+
+```bash
+# Last year (default: 1y)
+python3 jira_phrase_extractor.py --phrase "MetalLB"
+
+# Last 9 months
+python3 jira_phrase_extractor.py --phrase "MetalLB" --window 9m
+
+# Last 2 years
+python3 jira_phrase_extractor.py --phrase "MetalLB" --window 2y
+
+# Scope to specific projects
+python3 jira_phrase_extractor.py --phrase "MetalLB" --window 1y --projects SURE,NVSHAS
+
+# Only bug issues
+python3 jira_phrase_extractor.py --phrase "MetalLB" --window 2y --type Bug
+
+# Multiple issue types
+python3 jira_phrase_extractor.py --phrase "MetalLB" --window 2y --type Bug --type Escalation
+```
+
+Generated JQL looks like:
+
+```text
+text ~ "\"MetalLB\"" AND created >= "2025-06-04"
+```
+
+The extractor intentionally uses an absolute cutoff date for compatibility with
+Jira instances that reject relative year/month period syntax like `-2y`.
+
+Switch the date field for window filtering:
+
+```bash
+python3 jira_phrase_extractor.py --phrase "MetalLB" --window 9m --date-field updated
+```
+
+### CLI options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--phrase` | _(required)_ | Phrase to search for in issue text. |
+| `--window` | `1y` | Time window (`1y`, `9m`, `2y`, `12w`, `30d`, etc.). |
+| `--date-field` | `created` | Date field used for the window (`created` or `updated`). |
+| `--projects` | _(unset)_ | Optional comma-separated project keys (`SURE,NVSHAS`). |
+| `--type` | _(unset)_ | Optional issue type filter; repeat for multiple values (`--type Bug --type Escalation`). |
+| `--base-filename` | `jira_phrase_issues` | Base filename for generated CSV output. |
+
+---
+
 ## Notes
 - Jira Server / DC uses `POST /rest/api/2/search` with `startAt`/`total` pagination.
 - `main.py` fetches the status changelog per issue (`GET /rest/api/2/issue/{key}/changelog`) to compute time-in-status metrics. This adds one extra API call per issue.
