@@ -44,8 +44,18 @@ class IssueRecord:
     # JSON-encoded list of {"timestamp": str, "from_status": str, "to_status": str}
     # sorted ascending by timestamp; used for "time waiting" / "time actively worked" metrics.
     status_history: str = ""
+    # JSON-encoded list of
+    # {"timestamp": str, "from_assignee": str, "to_assignee": str,
+    #  "from_assignee_id": str, "to_assignee_id": str}
+    # sorted ascending by timestamp; used for assignment-based acceptance metrics.
+    assignee_history: str = ""
     # JSON-encoded list of {"author": str, "created": str}; used for "time to initial response".
     comment_authors_dates: str = ""
+    # JSON-encoded list of
+    # {"timestamp": str, "from_priority": str, "to_priority": str,
+    #  "from_priority_id": str, "to_priority_id": str}
+    # sorted ascending by timestamp; used for time-aware priority SLA metrics.
+    priority_history: str = ""
 
 
 # Default Jira issue fields to request. The account-name custom field id (if
@@ -172,16 +182,24 @@ class JiraClient:
 
         return all_comments
 
-    def fetch_status_history(self, issue_key: str) -> list[dict[str, Any]]:
-        """Return status transitions for an issue, sorted by timestamp ascending.
+    def fetch_status_assignee_and_priority_history(
+        self, issue_key: str
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return status, assignee, and priority transitions for an issue.
 
-        Each entry: {"timestamp": str, "from_status": str, "to_status": str}
+        Status entries: {"timestamp": str, "from_status": str, "to_status": str}
+        Assignee entries:
+        {"timestamp": str, "from_assignee": str, "to_assignee": str,
+         "from_assignee_id": str, "to_assignee_id": str}
+        Priority entries:
+        {"timestamp": str, "from_priority": str, "to_priority": str,
+         "from_priority_id": str, "to_priority_id": str}
 
         Tries the paginated /changelog endpoint (Jira 8.x+) first; on 404 falls
         back to fetching the issue with expand=changelog (older Jira Server/DC).
         """
         try:
-            return self._fetch_status_history_paginated(issue_key)
+            return self._fetch_histories_paginated(issue_key)
         except requests.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 404:
                 logger.debug(
@@ -189,13 +207,59 @@ class JiraClient:
                     "retrying with expand=changelog.",
                     issue_key,
                 )
-                return self._fetch_status_history_expand(issue_key)
+                return self._fetch_histories_expand(issue_key)
             raise
 
-    def _fetch_status_history_paginated(
+    @staticmethod
+    def _extract_histories(
+        histories: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        status_transitions: list[dict[str, Any]] = []
+        assignee_transitions: list[dict[str, Any]] = []
+        priority_transitions: list[dict[str, Any]] = []
+
+        for history in histories:
+            created = str(history.get("created", ""))
+            for item in history.get("items", []):
+                field = str(item.get("field", ""))
+                if field == "status":
+                    status_transitions.append(
+                        {
+                            "timestamp": created,
+                            "from_status": str(item.get("fromString", "")),
+                            "to_status": str(item.get("toString", "")),
+                        }
+                    )
+                elif field == "assignee":
+                    assignee_transitions.append(
+                        {
+                            "timestamp": created,
+                            "from_assignee": str(item.get("fromString", "")),
+                            "to_assignee": str(item.get("toString", "")),
+                            "from_assignee_id": str(item.get("from", "")),
+                            "to_assignee_id": str(item.get("to", "")),
+                        }
+                    )
+                elif field == "priority":
+                    priority_transitions.append(
+                        {
+                            "timestamp": created,
+                            "from_priority": str(item.get("fromString", "")),
+                            "to_priority": str(item.get("toString", "")),
+                            "from_priority_id": str(item.get("from", "")),
+                            "to_priority_id": str(item.get("to", "")),
+                        }
+                    )
+
+        status_sorted = sorted(status_transitions, key=lambda x: x["timestamp"])
+        assignee_sorted = sorted(assignee_transitions, key=lambda x: x["timestamp"])
+        priority_sorted = sorted(priority_transitions, key=lambda x: x["timestamp"])
+        return status_sorted, assignee_sorted, priority_sorted
+
+    def _fetch_histories_paginated(
         self, issue_key: str
-    ) -> list[dict[str, Any]]:
-        transitions: list[dict[str, Any]] = []
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        all_histories: list[dict[str, Any]] = []
         start_at = 0
 
         while True:
@@ -205,17 +269,7 @@ class JiraClient:
                 params={"startAt": start_at, "maxResults": PAGE_SIZE},
             )
             histories = data.get("values", []) or []
-            for history in histories:
-                created = str(history.get("created", ""))
-                for item in history.get("items", []):
-                    if item.get("field") == "status":
-                        transitions.append(
-                            {
-                                "timestamp": created,
-                                "from_status": str(item.get("fromString", "")),
-                                "to_status": str(item.get("toString", "")),
-                            }
-                        )
+            all_histories.extend(histories)
             fetched = len(histories)
             try:
                 total = int(data.get("total", 0))
@@ -225,30 +279,18 @@ class JiraClient:
             if fetched == 0 or start_at >= total:
                 break
 
-        return sorted(transitions, key=lambda x: x["timestamp"])
+        return self._extract_histories(all_histories)
 
-    def _fetch_status_history_expand(
+    def _fetch_histories_expand(
         self, issue_key: str
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         data = self._request(
             "GET",
             f"issue/{issue_key}",
             params={"expand": "changelog", "fields": ""},
         )
         histories = (data.get("changelog") or {}).get("histories", []) or []
-        transitions: list[dict[str, Any]] = []
-        for history in histories:
-            created = str(history.get("created", ""))
-            for item in history.get("items", []):
-                if item.get("field") == "status":
-                    transitions.append(
-                        {
-                            "timestamp": created,
-                            "from_status": str(item.get("fromString", "")),
-                            "to_status": str(item.get("toString", "")),
-                        }
-                    )
-        return sorted(transitions, key=lambda x: x["timestamp"])
+        return self._extract_histories(histories)
 
     # ---- Mapping -------------------------------------------------------
 
@@ -333,13 +375,23 @@ class JiraClient:
         issue_key = str(issue.get("key", ""))
         if self.fetch_changelog:
             try:
-                status_transitions = self.fetch_status_history(issue_key)
+                (
+                    status_transitions,
+                    assignee_transitions,
+                    priority_transitions,
+                ) = self.fetch_status_assignee_and_priority_history(issue_key)
                 status_history_json = json.dumps(status_transitions)
+                assignee_history_json = json.dumps(assignee_transitions)
+                priority_history_json = json.dumps(priority_transitions)
             except requests.RequestException as exc:
                 logger.warning("Failed to fetch changelog for %s: %s", issue_key, exc)
                 status_history_json = "[]"
+                assignee_history_json = "[]"
+                priority_history_json = "[]"
         else:
             status_history_json = "[]"
+            assignee_history_json = "[]"
+            priority_history_json = "[]"
 
         return IssueRecord(
             key=issue_key,
@@ -358,7 +410,9 @@ class JiraClient:
             description=adf_to_text(fields.get("description", "")).strip(),
             comments="\n\n".join(comments_text).strip(),
             status_history=status_history_json,
+            assignee_history=assignee_history_json,
             comment_authors_dates=comment_authors_dates,
+            priority_history=priority_history_json,
         )
 
 
